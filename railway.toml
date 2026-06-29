@@ -1,0 +1,9 @@
+# Railway deployment config for AuraStream FTP Gateway
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node server.js"
+healthcheckPath = ""
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
