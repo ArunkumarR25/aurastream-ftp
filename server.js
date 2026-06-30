@@ -263,8 +263,22 @@ const sftpServer = new Server({ hostKeys: [hostKey] }, (client) => {
     });
   });
 
-  client.on('close', () => console.log('[SSH]  Client disconnected'));
-  client.on('error', (e)  => console.error('[SSH]  Error:', e.message));
+  client.on('close', () => {
+    console.log('[SSH]  Client disconnected — flushing any unclosed handles…');
+    // Phone sends all WRITE data but disconnects without sending CLOSE.
+    // Upload whatever data we accumulated in open handles.
+    for (const [id, obj] of handles) {
+      if (!obj.isDir && obj.chunks && obj.chunks.length > 0) {
+        const totalBytes = obj.chunks.reduce((s, c) => s + c.data.length, 0);
+        console.log(`[SFTP] Flushing unclosed handle=${id} file="${obj.filename}" chunks=${obj.chunks.length} totalBytes=${totalBytes}`);
+        obj.chunks.sort((a, b) => a.offset - b.offset);
+        const fileBuffer = Buffer.concat(obj.chunks.map((c) => c.data));
+        uploadBufferToSupabase(fileBuffer, obj.filename, clientEventId);
+      }
+    }
+    handles.clear();
+  });
+  client.on('error', (e) => console.error('[SSH]  Error:', e.message));
 });
 
 // ── 6. Start listening ────────────────────────────────────────────────────────
