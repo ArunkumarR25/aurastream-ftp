@@ -102,10 +102,10 @@ const sftpServer = new Server({
     const password = ctx.password;
     console.log(`[AUTH] Login attempt for user: "${username}"`);
 
-    const parsedEventId = username.startsWith('event_') ? username.slice(6) : username;
+    const parsedEventId = (username.startsWith('event_') ? username.slice(6) : username).trim();
 
     if (uploadSecret && password !== uploadSecret) {
-      console.log(`[AUTH] ❌ Incorrect password for "${username}"`);
+      console.log(`[AUTH] ❌ Incorrect password/secret for user "${username}". Provided: "${password}", Expected: "${uploadSecret}"`);
       return ctx.reject();
     }
 
@@ -117,8 +117,13 @@ const sftpServer = new Server({
         .eq('id', parsedEventId)
         .single();
 
-      if (error || !event) {
-        console.log(`[AUTH] ❌ Event "${parsedEventId}" not found in database.`);
+      if (error) {
+        console.log(`[AUTH] ❌ Supabase Database Query Error for Event "${parsedEventId}":`, error.message || error);
+        return ctx.reject();
+      }
+
+      if (!event) {
+        console.log(`[AUTH] ❌ Event ID "${parsedEventId}" not found in database. Double-check your event ID.`);
         return ctx.reject();
       }
 
@@ -129,7 +134,7 @@ const sftpServer = new Server({
       console.log(`[AUTH] ✅ Authenticated successfully — Event: "${event.event_name}" (${eventId})`);
       ctx.accept();
     } catch (err) {
-      console.error('[AUTH] Database error:', err.message);
+      console.error('[AUTH] Server logic exception:', err.message || err);
       ctx.reject();
     }
   }).on('ready', () => {
