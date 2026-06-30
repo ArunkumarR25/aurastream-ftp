@@ -1,14 +1,14 @@
 {
-  "name": "aurastream-ftp-server",
+  "name": "aurastream-sftp-server",
   "version": "1.0.0",
-  "description": "AuraStream FTP Upload Gateway — receives photos from cameras and pushes to Supabase",
+  "description": "AuraStream SFTP Upload Gateway — receives photos from cameras and pushes to Supabase on a single port",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.1",
-    "ftp-srv": "^4.6.3",
+    "ssh2": "^1.15.0",
     "ws": "^8.21.0"
   },
   "engines": {
