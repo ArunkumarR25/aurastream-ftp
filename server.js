@@ -8,7 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { Server, SFTP_STATUS_CODE: STATUS_CODE } = require('ssh2');
+const { Server, utils: { sftp: { STATUS_CODE } } } = require('ssh2');
 const { generateKeyPairSync } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
