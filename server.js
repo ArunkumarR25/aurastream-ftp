@@ -1,308 +1,242 @@
 /**
- * AURA STREAM — Cloud SFTP Upload Gateway (Single Port)
+ * AURA STREAM — Cloud SFTP Upload Gateway (Single Port, Memory-Based)
  *
- * Deploy this on Railway.app (free).
- * Cameras connect via SFTP on a single port → photos auto-upload to Supabase.
+ * Deploy on Railway.app (free tier).
+ * Camera → SFTP (single TCP port) → memory buffer → Supabase → live guest stream.
+ *
+ * Required env vars (set in Railway dashboard):
+ *   NEXT_PUBLIC_SUPABASE_URL
+ *   SUPABASE_SERVICE_ROLE_KEY
+ *   UPLOAD_SECRET        — camera password
+ *   PORT                 — Railway sets this automatically
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { Server, utils: { sftp: { STATUS_CODE } } } = require('ssh2');
+'use strict';
+
+const { Server, utils: { sftp: { STATUS_CODE, flagsToString } } } = require('ssh2');
 const { generateKeyPairSync } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
-const ws = require('ws');
 
-// ── 1. Environment Variables ─────────────────────────────────────────────────
-const supabaseUrl  = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseKey  = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const uploadSecret = process.env.UPLOAD_SECRET;
-const PORT         = parseInt(process.env.PORT || '2222', 10);
+// ── 1. Config ──────────────────────────────────────────────────────────────────
+const SUPABASE_URL  = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const UPLOAD_SECRET = process.env.UPLOAD_SECRET;
+const PORT          = parseInt(process.env.PORT || '2222', 10);
 
-if (!supabaseUrl || !supabaseKey) {
-  console.error('❌ Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+const VALID_EXTS = new Set(['jpg', 'jpeg', 'png', 'heic', 'heif', 'cr2', 'cr3', 'nef', 'arw', 'dng']);
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌  Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
 
-// ── 2. Supabase Admin Client ─────────────────────────────────────────────────
-const supabase = createClient(supabaseUrl, supabaseKey, {
+// ── 2. Supabase client ────────────────────────────────────────────────────────
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
-  realtime: { transport: ws },
 });
 
-// ── 3. Temp directory for incoming SFTP uploads ──────────────────────────────
-const TEMP_DIR = path.join(os.tmpdir(), 'aura-sftp-temp');
-fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-// ── 4. Generate Host Keys (Ephemeral - No Setup Needed) ──────────────────────
-console.log('Generating ephemeral host key...');
-const hostKey = generateKeyPairSync('rsa', {
+// ── 3. Ephemeral RSA host key (generated fresh on each start — no file needed) ─
+console.log('[STARTUP] Generating ephemeral host key …');
+const { privateKey: hostKey } = generateKeyPairSync('rsa', {
   modulusLength: 2048,
-  publicKeyEncoding: { type: 'pkcs1', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
-}).privateKey;
+  publicKeyEncoding:  { type: 'pkcs1', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+});
 
-// ── 5. Helper: Upload file to Supabase ───────────────────────────────────────
-async function uploadToSupabase(filePath, filename, eventId) {
-  const ext = filename.split('.').pop()?.toLowerCase();
-  const validExts = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'cr2', 'cr3', 'nef', 'arw', 'dng'];
-  
-  if (!validExts.includes(ext)) {
-    console.log(`[UPLOAD] ⚠️ Ignored invalid extension: ${filename}`);
-    fs.unlinkSync(filePath);
+// ── 4. Upload a buffer directly to Supabase storage ──────────────────────────
+async function uploadBufferToSupabase(buffer, filename, eventId) {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+
+  if (!VALID_EXTS.has(ext)) {
+    console.log(`[UPLOAD] ⚠️  Skipping unsupported extension: ${filename}`);
     return;
   }
 
-  try {
-    const stat = fs.statSync(filePath);
-    console.log(`[UPLOAD] 📷 Starting upload: ${filename} (${eventId}) — ${(stat.size / 1024).toFixed(0)} KB`);
-    
-    const buffer = fs.readFileSync(filePath);
-    const storagePath = `events/${eventId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+  const storagePath = `events/${eventId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const mime        = ext === 'png' ? 'image/png' : 'image/jpeg';
 
-    const { error: uploadErr } = await supabase.storage
+  console.log(`[UPLOAD] 📤 Uploading ${filename} (${(buffer.length / 1024).toFixed(0)} KB) to Supabase…`);
+
+  try {
+    const { error: upErr } = await supabase.storage
       .from('wedding-photos')
       .upload(storagePath, buffer, { contentType: mime, cacheControl: '3600', upsert: false });
-    if (uploadErr) throw uploadErr;
+    if (upErr) throw upErr;
 
-    const { data: urlData } = supabase.storage.from('wedding-photos').getPublicUrl(storagePath);
+    const { data: urlData } = supabase.storage
+      .from('wedding-photos')
+      .getPublicUrl(storagePath);
 
     const { error: dbErr } = await supabase
       .from('event_images')
       .insert({ event_id: eventId, storage_path: storagePath, public_url: urlData.publicUrl });
     if (dbErr) throw dbErr;
 
-    console.log(`[UPLOAD] ✅ Successfully uploaded to guest stream: ${filename}`);
+    console.log(`[UPLOAD] ✅ Live on guest stream: ${urlData.publicUrl}`);
   } catch (err) {
-    console.error(`[UPLOAD] ❌ Failed to upload ${filename}:`, err.message);
-  } finally {
-    if (fs.existsSync(filePath)) {
-      try { fs.unlinkSync(filePath); } catch (_) {}
-    }
+    console.error(`[UPLOAD] ❌ Failed — ${filename}:`, err.message);
   }
 }
 
-// ── 6. SSH/SFTP Server Initialization ────────────────────────────────────────
-const sftpServer = new Server({
-  hostKeys: [hostKey]
-}, (client) => {
-  let eventId = '';
-  let userSandboxDir = '';
-  const handles = new Map();
-  let handleCounter = 0;
+// ── 5. SFTP Server ────────────────────────────────────────────────────────────
+const sftpServer = new Server({ hostKeys: [hostKey] }, (client) => {
+  let clientEventId = null;
 
+  // Per-connection file handle registry
+  // key: uint32 handle ID, value: { chunks[], filename, isDir }
+  const handles  = new Map();
+  let   nextId   = 1;
+
+  function makeHandle(id) {
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32BE(id, 0);
+    return buf;
+  }
+  function readHandle(buf) {
+    return buf.readUInt32BE(0);
+  }
+
+  // ── Auth ───────────────────────────────────────────────────────────────────
   client.on('authentication', async (ctx) => {
-    // Authenticate by username and password
-    if (ctx.method !== 'password') {
-      return ctx.reject(['password']);
-    }
+    if (ctx.method !== 'password') return ctx.reject(['password']);
 
-    const username = ctx.username;
-    const password = ctx.password;
-    console.log(`[AUTH] Login attempt for user: "${username}"`);
+    const username     = ctx.username.trim();
+    const password     = ctx.password;
+    const parsedId     = username.startsWith('event_') ? username.slice(6) : username;
 
-    const parsedEventId = (username.startsWith('event_') ? username.slice(6) : username).trim();
+    console.log(`[AUTH] Attempt — user: "${username}", eventId: "${parsedId}"`);
 
-    if (uploadSecret && password !== uploadSecret) {
-      console.log(`[AUTH] ❌ Incorrect password/secret for user "${username}". Provided: "${password}", Expected: "${uploadSecret}"`);
+    // Password check
+    if (UPLOAD_SECRET && password !== UPLOAD_SECRET) {
+      console.warn(`[AUTH] ❌ Wrong password for "${username}"`);
       return ctx.reject();
     }
 
+    // Verify event in DB
     try {
-      // Validate event exists in database
       const { data: event, error } = await supabase
         .from('events')
         .select('id, event_name')
-        .eq('id', parsedEventId)
+        .eq('id', parsedId)
         .single();
 
-      if (error) {
-        console.log(`[AUTH] ❌ Supabase Database Query Error for Event "${parsedEventId}":`, error.message || error);
-        return ctx.reject();
-      }
+      if (error) { console.warn('[AUTH] ❌ Supabase error:', error.message); return ctx.reject(); }
+      if (!event) { console.warn(`[AUTH] ❌ Event "${parsedId}" not found`); return ctx.reject(); }
 
-      if (!event) {
-        console.log(`[AUTH] ❌ Event ID "${parsedEventId}" not found in database. Double-check your event ID.`);
-        return ctx.reject();
-      }
-
-      eventId = event.id;
-      userSandboxDir = path.join(TEMP_DIR, eventId);
-      fs.mkdirSync(userSandboxDir, { recursive: true });
-
-      console.log(`[AUTH] ✅ Authenticated successfully — Event: "${event.event_name}" (${eventId})`);
+      clientEventId = event.id;
+      console.log(`[AUTH] ✅ OK — event: "${event.event_name}" (${clientEventId})`);
       ctx.accept();
-    } catch (err) {
-      console.error('[AUTH] Server logic exception:', err.message || err);
+    } catch (e) {
+      console.error('[AUTH] Exception:', e.message);
       ctx.reject();
     }
-  }).on('ready', () => {
-    console.log('[SSH] Connection established and client authenticated.');
+  });
 
-    client.on('session', (accept, reject) => {
+  client.on('ready', () => {
+    console.log('[SSH]  Client ready');
+
+    client.on('session', (accept) => {
       const session = accept();
 
-      session.on('sftp', (accept, reject) => {
-        const sftpStream = accept();
-        console.log('[SFTP] Subsystem session started.');
+      session.on('sftp', (accept) => {
+        const sftp = accept();
+        console.log('[SFTP] Session started');
 
-        sftpStream.on('REALPATH', (reqid, clientPath) => {
-          // Send back root "/" path to client
-          sftpStream.name(reqid, [{ filename: '/' }]);
+        // ── REALPATH ─────────────────────────────────────────────────────
+        sftp.on('REALPATH', (reqid) => {
+          sftp.name(reqid, [{ filename: '/', longname: 'drwxr-xr-x 1 user group 0 Jan 1 00:00 /', attrs: {} }]);
         });
 
-        sftpStream.on('STAT', (reqid, clientPath) => {
-          // Simulate directory attributes or stats
-          const resolvedPath = path.join(userSandboxDir, clientPath.replace(/^\/+/, ''));
-          try {
-            const stats = fs.statSync(resolvedPath);
-            sftpStream.attrs(reqid, {
-              mode: stats.mode,
-              size: stats.size,
-              mtime: Math.floor(stats.mtimeMs / 1000),
-              atime: Math.floor(stats.atimeMs / 1000)
-            });
-          } catch (err) {
-            // If checking root directory path, return directory attributes
-            if (clientPath === '/' || clientPath === '.') {
-              sftpStream.attrs(reqid, {
-                mode: 0o40000 | 0o777, // Directory
-                size: 0,
-                mtime: Math.floor(Date.now() / 1000),
-                atime: Math.floor(Date.now() / 1000)
-              });
-            } else {
-              sftpStream.status(reqid, STATUS_CODE.NO_SUCH_FILE);
-            }
-          }
+        // ── STAT / LSTAT ──────────────────────────────────────────────────
+        const dirAttrs = { mode: 0o40755, uid: 0, gid: 0, size: 0, atime: 0, mtime: 0 };
+        sftp.on('STAT',  (reqid) => sftp.attrs(reqid, dirAttrs));
+        sftp.on('LSTAT', (reqid) => sftp.attrs(reqid, dirAttrs));
+
+        // ── OPENDIR ───────────────────────────────────────────────────────
+        sftp.on('OPENDIR', (reqid) => {
+          const id = nextId++;
+          handles.set(id, { isDir: true, listed: false });
+          sftp.handle(reqid, makeHandle(id));
         });
 
-        sftpStream.on('LSTAT', (reqid, clientPath) => {
-          // Redirect LSTAT to STAT logic
-          sftpStream.emit('STAT', reqid, clientPath);
+        // ── READDIR (just return EOF — camera only needs to write) ─────────
+        sftp.on('READDIR', (reqid) => {
+          sftp.status(reqid, STATUS_CODE.EOF);
         });
 
-        sftpStream.on('OPENDIR', (reqid, clientPath) => {
-          handleCounter++;
-          const handleStr = `d${handleCounter}`;
-          handles.set(handleStr, { isDir: true, path: clientPath });
-          sftpStream.handle(reqid, Buffer.from(handleStr));
+        // ── OPEN (file for writing — store chunks in memory) ──────────────
+        sftp.on('OPEN', (reqid, filename, flags) => {
+          const mode     = flagsToString(flags) || 'w';
+          const basename = filename.split('/').filter(Boolean).pop() || filename;
+          const id       = nextId++;
+
+          console.log(`[SFTP] OPEN "${basename}" mode=${mode} handle=${id}`);
+
+          handles.set(id, {
+            isDir:    false,
+            filename: basename,
+            chunks:   [],       // { offset, data } pairs stored in memory
+          });
+
+          sftp.handle(reqid, makeHandle(id));
         });
 
-        sftpStream.on('READDIR', (reqid, handle) => {
-          // Just return EOF to represent an empty directory listing
-          sftpStream.status(reqid, STATUS_CODE.EOF);
+        // ── WRITE (accumulate chunk in memory) ────────────────────────────
+        sftp.on('WRITE', (reqid, handle, offset, data) => {
+          const id  = readHandle(handle);
+          const obj = handles.get(id);
+          if (!obj || obj.isDir) return sftp.status(reqid, STATUS_CODE.FAILURE);
+
+          // Clone the data buffer (ssh2 reuses the underlying buffer)
+          obj.chunks.push({ offset, data: Buffer.from(data) });
+          sftp.status(reqid, STATUS_CODE.OK);
         });
 
-        sftpStream.on('OPEN', (reqid, filename, flags, attrs) => {
-          const sanitizedFilename = filename.replace(/^\/+/, '');
-          const localPath = path.join(userSandboxDir, sanitizedFilename);
-          
-          console.log(`[SFTP] Client opening file for writing: ${sanitizedFilename}`);
-          
-          try {
-            // Ensure target folder exists
-            fs.mkdirSync(path.dirname(localPath), { recursive: true });
-            
-            // Open file for writing
-            const fd = fs.openSync(localPath, 'w');
-            
-            handleCounter++;
-            const handleStr = `f${handleCounter}`;
-            handles.set(handleStr, { fd, localPath, filename: sanitizedFilename });
-            
-            sftpStream.handle(reqid, Buffer.from(handleStr));
-          } catch (err) {
-            console.error(`[SFTP] Open error:`, err.message);
-            sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
+        // ── CLOSE (reassemble + upload to Supabase) ───────────────────────
+        sftp.on('CLOSE', (reqid, handle) => {
+          const id  = readHandle(handle);
+          const obj = handles.get(id);
+          if (!obj) return sftp.status(reqid, STATUS_CODE.FAILURE);
+
+          handles.delete(id);
+          sftp.status(reqid, STATUS_CODE.OK);  // Ack immediately
+
+          if (obj.isDir || obj.chunks.length === 0) return;
+
+          // Sort by offset and concat into one buffer
+          obj.chunks.sort((a, b) => a.offset - b.offset);
+          const fileBuffer = Buffer.concat(obj.chunks.map((c) => c.data));
+
+          console.log(`[SFTP] CLOSE "${obj.filename}" — ${(fileBuffer.length / 1024).toFixed(0)} KB, ${obj.chunks.length} chunks`);
+
+          // Fire-and-forget upload
+          uploadBufferToSupabase(fileBuffer, obj.filename, clientEventId);
         });
 
-        sftpStream.on('WRITE', (reqid, handle, offset, data) => {
-          const handleStr = handle.toString();
-          const handleObj = handles.get(handleStr);
-          if (!handleObj) {
-            return sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
-
-          try {
-            fs.writeSync(handleObj.fd, data, 0, data.length, offset);
-            sftpStream.status(reqid, STATUS_CODE.OK);
-          } catch (err) {
-            console.error(`[SFTP] Write error:`, err.message);
-            sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
-        });
-
-        sftpStream.on('CLOSE', (reqid, handle) => {
-          const handleStr = handle.toString();
-          const handleObj = handles.get(handleStr);
-          if (!handleObj) {
-            return sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
-
-          try {
-            if (handleObj.fd) {
-              fs.closeSync(handleObj.fd);
-              handles.delete(handleStr);
-              sftpStream.status(reqid, STATUS_CODE.OK);
-
-              console.log(`[SFTP] Finished transfer: ${handleObj.filename}`);
-              // Queue upload directly to Supabase
-              uploadToSupabase(handleObj.localPath, handleObj.filename, eventId);
-            } else {
-              handles.delete(handleStr);
-              sftpStream.status(reqid, STATUS_CODE.OK);
-            }
-          } catch (err) {
-            console.error(`[SFTP] Close error:`, err.message);
-            sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
-        });
-
-        sftpStream.on('MKDIR', (reqid, clientPath, attrs) => {
-          const localPath = path.join(userSandboxDir, clientPath.replace(/^\/+/, ''));
-          try {
-            fs.mkdirSync(localPath, { recursive: true });
-            sftpStream.status(reqid, STATUS_CODE.OK);
-          } catch (err) {
-            sftpStream.status(reqid, STATUS_CODE.FAILURE);
-          }
-        });
-
-        sftpStream.on('REMOVE', (reqid, clientPath) => {
-          sftpStream.status(reqid, STATUS_CODE.OK);
-        });
-
-        sftpStream.on('RMDIR', (reqid, clientPath) => {
-          sftpStream.status(reqid, STATUS_CODE.OK);
-        });
-
-        sftpStream.on('RENAME', (reqid, oldPath, newPath) => {
-          sftpStream.status(reqid, STATUS_CODE.OK);
-        });
+        // ── MKDIR / RENAME / REMOVE — silently OK ─────────────────────────
+        sftp.on('MKDIR',  (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+        sftp.on('RENAME', (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+        sftp.on('REMOVE', (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+        sftp.on('RMDIR',  (reqid) => sftp.status(reqid, STATUS_CODE.OK));
       });
     });
-  }).on('close', () => {
-    console.log('[SSH] Client disconnected.');
-  }).on('error', (err) => {
-    console.error('[SSH] Connection error:', err.message);
   });
+
+  client.on('close', () => console.log('[SSH]  Client disconnected'));
+  client.on('error', (e)  => console.error('[SSH]  Error:', e.message));
 });
 
+// ── 6. Start listening ────────────────────────────────────────────────────────
 sftpServer.listen(PORT, '0.0.0.0', () => {
   console.log('\n╔══════════════════════════════════════════════════╗');
-  console.log('║       AURA STREAM — SFTP Gateway (Cloud)         ║');
+  console.log('║     AURA STREAM — Cloud SFTP Gateway (Ready)     ║');
   console.log('╠══════════════════════════════════════════════════╣');
-  console.log(`║  SFTP Port   : ${PORT}`);
-  console.log(`║  Protocol    : SSH / SFTP (Single Port)          ║`);
-  console.log(`║  Auth Secret : ${uploadSecret ? '✅ Set' : '⚠️ NOT SET'}`);
+  console.log(`║  Port       : ${PORT}`);
+  console.log(`║  Auth       : ${UPLOAD_SECRET ? '✅ Password enabled' : '⚠️  Open (no password)'}`);
   console.log('╠══════════════════════════════════════════════════╣');
-  console.log('║  Camera Settings:                                ║');
-  console.log('║   Protocol → SFTP (SSH File Transfer)            ║');
-  console.log('║   Port     → (Your Railway Public Port)          ║');
+  console.log('║  Camera setup:                                   ║');
+  console.log('║   Protocol → SFTP                                ║');
   console.log('║   Username → event_<eventId>                     ║');
-  console.log(`║   Password → ${uploadSecret || '(none)'}`);
+  console.log(`║   Password → ${UPLOAD_SECRET || '(none)'}`);
   console.log('╚══════════════════════════════════════════════════╝\n');
 });
