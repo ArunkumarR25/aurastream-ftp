@@ -142,82 +142,123 @@ const sftpServer = new Server({ hostKeys: [hostKey] }, (client) => {
         const sftp = accept();
         console.log('[SFTP] Session started');
 
+        // helper: safely read a uint32 handle, return null on error
+        function safeId(handle) {
+          try { return handle.readUInt32BE(0); }
+          catch (e) { console.error('[SFTP] Bad handle buffer:', handle, e.message); return null; }
+        }
+
+        // pending renames: oldName → { buffer, filename }
+        const pendingBuffers = new Map(); // filename → Buffer (for rename support)
+
         // ── REALPATH ─────────────────────────────────────────────────────
-        sftp.on('REALPATH', (reqid) => {
+        sftp.on('REALPATH', (reqid, p) => {
+          console.log(`[SFTP] REALPATH "${p}"`);
           sftp.name(reqid, [{ filename: '/', longname: 'drwxr-xr-x 1 user group 0 Jan 1 00:00 /', attrs: {} }]);
         });
 
         // ── STAT / LSTAT ──────────────────────────────────────────────────
         const dirAttrs = { mode: 0o40755, uid: 0, gid: 0, size: 0, atime: 0, mtime: 0 };
-        sftp.on('STAT',  (reqid) => sftp.attrs(reqid, dirAttrs));
-        sftp.on('LSTAT', (reqid) => sftp.attrs(reqid, dirAttrs));
+        sftp.on('STAT',  (reqid, p) => { console.log(`[SFTP] STAT "${p}"`);  sftp.attrs(reqid, dirAttrs); });
+        sftp.on('LSTAT', (reqid, p) => { console.log(`[SFTP] LSTAT "${p}"`); sftp.attrs(reqid, dirAttrs); });
 
         // ── OPENDIR ───────────────────────────────────────────────────────
-        sftp.on('OPENDIR', (reqid) => {
+        sftp.on('OPENDIR', (reqid, p) => {
           const id = nextId++;
-          handles.set(id, { isDir: true, listed: false });
+          console.log(`[SFTP] OPENDIR "${p}" handle=${id}`);
+          handles.set(id, { isDir: true });
           sftp.handle(reqid, makeHandle(id));
         });
 
-        // ── READDIR (just return EOF — camera only needs to write) ─────────
+        // ── READDIR ───────────────────────────────────────────────────────
         sftp.on('READDIR', (reqid) => {
+          console.log('[SFTP] READDIR → EOF');
           sftp.status(reqid, STATUS_CODE.EOF);
         });
 
-        // ── OPEN (file for writing — store chunks in memory) ──────────────
+        // ── OPEN ──────────────────────────────────────────────────────────
         sftp.on('OPEN', (reqid, filename, flags) => {
           const mode     = flagsToString(flags) || 'w';
           const basename = filename.split('/').filter(Boolean).pop() || filename;
           const id       = nextId++;
-
           console.log(`[SFTP] OPEN "${basename}" mode=${mode} handle=${id}`);
-
-          handles.set(id, {
-            isDir:    false,
-            filename: basename,
-            chunks:   [],       // { offset, data } pairs stored in memory
-          });
-
+          handles.set(id, { isDir: false, filename: basename, chunks: [] });
           sftp.handle(reqid, makeHandle(id));
         });
 
-        // ── WRITE (accumulate chunk in memory) ────────────────────────────
+        // ── WRITE ─────────────────────────────────────────────────────────
         sftp.on('WRITE', (reqid, handle, offset, data) => {
-          const id  = readHandle(handle);
-          const obj = handles.get(id);
-          if (!obj || obj.isDir) return sftp.status(reqid, STATUS_CODE.FAILURE);
+          const id = safeId(handle);
+          if (id === null) return sftp.status(reqid, STATUS_CODE.FAILURE);
 
-          // Clone the data buffer (ssh2 reuses the underlying buffer)
+          const obj = handles.get(id);
+          if (!obj || obj.isDir) {
+            console.warn(`[SFTP] WRITE — no handle for id=${id}`);
+            return sftp.status(reqid, STATUS_CODE.FAILURE);
+          }
+
           obj.chunks.push({ offset, data: Buffer.from(data) });
+          const total = obj.chunks.reduce((s, c) => s + c.data.length, 0);
+          console.log(`[SFTP] WRITE handle=${id} offset=${offset} chunkSize=${data.length} totalSoFar=${total}`);
           sftp.status(reqid, STATUS_CODE.OK);
         });
 
-        // ── CLOSE (reassemble + upload to Supabase) ───────────────────────
+        // ── CLOSE ─────────────────────────────────────────────────────────
         sftp.on('CLOSE', (reqid, handle) => {
-          const id  = readHandle(handle);
+          const id = safeId(handle);
+          if (id === null) return sftp.status(reqid, STATUS_CODE.FAILURE);
+
           const obj = handles.get(id);
-          if (!obj) return sftp.status(reqid, STATUS_CODE.FAILURE);
+          if (!obj) {
+            console.warn(`[SFTP] CLOSE — unknown handle id=${id}`);
+            return sftp.status(reqid, STATUS_CODE.FAILURE);
+          }
 
           handles.delete(id);
-          sftp.status(reqid, STATUS_CODE.OK);  // Ack immediately
+          sftp.status(reqid, STATUS_CODE.OK); // ack immediately
 
-          if (obj.isDir || obj.chunks.length === 0) return;
+          if (obj.isDir) { console.log(`[SFTP] CLOSE dir handle=${id}`); return; }
 
-          // Sort by offset and concat into one buffer
+          const totalBytes = obj.chunks.reduce((s, c) => s + c.data.length, 0);
+          console.log(`[SFTP] CLOSE file="${obj.filename}" handle=${id} chunks=${obj.chunks.length} totalBytes=${totalBytes}`);
+
+          if (obj.chunks.length === 0) {
+            console.log('[SFTP] No data in this handle — skipping upload');
+            return;
+          }
+
           obj.chunks.sort((a, b) => a.offset - b.offset);
           const fileBuffer = Buffer.concat(obj.chunks.map((c) => c.data));
+          console.log(`[SFTP] Assembled ${(fileBuffer.length / 1024).toFixed(0)} KB from ${obj.chunks.length} chunks`);
 
-          console.log(`[SFTP] CLOSE "${obj.filename}" — ${(fileBuffer.length / 1024).toFixed(0)} KB, ${obj.chunks.length} chunks`);
+          // Cache under filename in case a RENAME comes next
+          pendingBuffers.set(obj.filename, fileBuffer);
 
-          // Fire-and-forget upload
           uploadBufferToSupabase(fileBuffer, obj.filename, clientEventId);
         });
 
-        // ── MKDIR / RENAME / REMOVE — silently OK ─────────────────────────
-        sftp.on('MKDIR',  (reqid) => sftp.status(reqid, STATUS_CODE.OK));
-        sftp.on('RENAME', (reqid) => sftp.status(reqid, STATUS_CODE.OK));
-        sftp.on('REMOVE', (reqid) => sftp.status(reqid, STATUS_CODE.OK));
-        sftp.on('RMDIR',  (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+        // ── RENAME ────────────────────────────────────────────────────────
+        // Some phone apps upload to a temp file then rename to the real name.
+        // If we have the buffer cached under oldName, re-upload under newName.
+        sftp.on('RENAME', (reqid, oldPath, newPath) => {
+          const oldName = oldPath.split('/').filter(Boolean).pop() || oldPath;
+          const newName = newPath.split('/').filter(Boolean).pop() || newPath;
+          console.log(`[SFTP] RENAME "${oldName}" → "${newName}"`);
+
+          const buf = pendingBuffers.get(oldName);
+          if (buf) {
+            pendingBuffers.delete(oldName);
+            console.log(`[SFTP] Re-uploading ${(buf.length / 1024).toFixed(0)} KB under new name "${newName}"`);
+            uploadBufferToSupabase(buf, newName, clientEventId);
+          }
+
+          sftp.status(reqid, STATUS_CODE.OK);
+        });
+
+        // ── MKDIR / REMOVE / RMDIR ─────────────────────────────────────────
+        sftp.on('MKDIR',  (reqid, p)    => { console.log(`[SFTP] MKDIR "${p}"`);  sftp.status(reqid, STATUS_CODE.OK); });
+        sftp.on('REMOVE', (reqid, p)    => { console.log(`[SFTP] REMOVE "${p}"`); sftp.status(reqid, STATUS_CODE.OK); });
+        sftp.on('RMDIR',  (reqid, p)    => { console.log(`[SFTP] RMDIR "${p}"`);  sftp.status(reqid, STATUS_CODE.OK); });
       });
     });
   });
